@@ -1,32 +1,36 @@
+# app.py ーー そのまま丸ごとコピペOK
+
 import os
+import re
 import time
+import base64
+import json
 from collections import defaultdict, deque
 from typing import Optional
 
 from flask import Flask, request
 import requests
 
-# --- OpenAI 新SDK ---
+# --- OpenAI SDK ---
 from openai import OpenAI, RateLimitError
-import base64, json
 
 # ========= 環境 =========
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = Flask(__name__)
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
-AI_DISABLED = os.getenv("DISABLE_AI") == "1"   # ← 環境変数でAIを一時停止できる（"1"で有人モード）
+AI_DISABLED = os.getenv("DISABLE_AI") == "1"   # "1" でAIを一時停止（有人モード）
 
-# ========= スパム/嫌がらせ対策（閾値は運用に合わせて調整） =========
-RATE_MIN_INTERVAL_SEC = 5        # 1ユーザーの最小インターバル（秒）…5秒以内の連投を無視
+# ========= スパム/嫌がらせ対策（必要に応じて調整） =========
+RATE_MIN_INTERVAL_SEC = 5        # 1ユーザーの最小インターバル（秒）
 IMG_MAX_BYTES = 2 * 1024 * 1024  # 画像サイズ上限（2MB）
 IMG_MAX_PER_MIN = 3              # 1分あたり最大画像枚数
 MSG_MAX_PER_MIN = 15             # 1分あたり最大メッセージ数
 TEMP_BLOCK_MINUTES = 30          # 一時ブロック時間（分）
 
-# 状態（インメモリ）。Render再起動でリセットされる想定。
+# 状態（インメモリ：Render再起動でリセット）
 _last_msg_time = defaultdict(float)                  # userId -> 最終受信時刻
-_img_history = defaultdict(lambda: deque(maxlen=60)) # userId -> 直近60秒の画像受信タイムスタンプ
-_msg_history = defaultdict(lambda: deque(maxlen=60)) # userId -> 直近60秒の全メッセージ受信TS
+_img_history = defaultdict(lambda: deque(maxlen=60)) # userId -> 直近60秒の画像受信TS
+_msg_history = defaultdict(lambda: deque(maxlen=60)) # userId -> 直近60秒の全受信TS
 _blocked_until = defaultdict(float)                  # userId -> ブロック解除UNIX時刻
 
 
@@ -34,7 +38,7 @@ _blocked_until = defaultdict(float)                  # userId -> ブロック解
 # 返信ユーティリティ
 # ---------------------------
 def reply_text(reply_token: str, text: str):
-    """通常のテキスト返信"""
+    """テキスト返信（標準）"""
     try:
         requests.post(
             "https://api.line.me/v2/bot/message/reply",
@@ -73,7 +77,7 @@ def reply_text_with_quick(reply_token: str, text: str, quick_items=None):
 
 
 # ---------------------------
-# 画像取得
+# LINE画像の取得
 # ---------------------------
 def get_line_image_bytes(message_id: str) -> bytes:
     """LINEの画像コンテンツをバイト列で取得"""
@@ -84,7 +88,7 @@ def get_line_image_bytes(message_id: str) -> bytes:
 
 
 # ---------------------------
-# 査定ロジック（AI）
+# 査定ロジック（AIのシステムプロンプト）
 # ---------------------------
 ASSESS_SYSTEM = (
     "あなたはリユースショップの査定担当AIです。出力は必ずJSONのみ。"
@@ -98,12 +102,15 @@ ASSESS_SYSTEM = (
 
 def assess_from_text_or_image(user_text: str = "", image_bytes: Optional[bytes] = None) -> dict:
     """
-    テキスト/画像から査定（買取目安のみ返す）
-    429（残高不足）は {"error":"quota"} を返す
+    テキスト/画像から査定（買取目安のみ）
+    - chat.completions で回答
+    - JSONとしてパース → 失敗時は本文から { ... } を抽出して再パース
+    - それでもダメなら parse_failed
     """
     if AI_DISABLED:
         return {"error": "disabled"}
 
+    # ---- Vision対応の message 作成（画像なしでもOK）----
     content = []
     if user_text:
         content.append({"type": "text", "text": f"対象情報:\n{user_text}"})
@@ -112,69 +119,39 @@ def assess_from_text_or_image(user_text: str = "", image_bytes: Optional[bytes] 
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
 
     try:
-        # JSON出力を強制（パース失敗を減らす）
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": ASSESS_SYSTEM},
-                {"role": "user", "content": content},
+                {"role": "system", "content": ASSESS_SYSTEM + " 絶対にJSONだけを返してください。説明文は不要です。"},
+                {"role": "user", "content": content if content else [{"type": "text", "text": "対象情報なし"}]},
             ],
-            temperature=0.2,
+            temperature=0.1,
             timeout=25,
         )
         txt = (resp.choices[0].message.content or "").strip()
-
-        # 返答が空なら専用エラー
-        if not txt:
-            app.logger.warning("OpenAI empty response: %s", str(resp)[:500])
-            return {"error": "empty_response", "raw": "(no data from OpenAI)"}
-
-        # デバッグ用：先頭だけログ
         app.logger.info("OpenAI raw (head): %s", txt[:200])
 
-        return json.loads(txt)
+        # 1) まっすぐ JSON として読む
+        try:
+            return json.loads(txt)
+        except Exception:
+            pass
 
-    except RateLimitError:
-        return {"error": "quota"}
-    except json.JSONDecodeError as je:
-        app.logger.warning("JSON decode error: %s | text head=%s", je, txt[:200])
-        return {"error": "parse_failed", "raw": txt[:500]}
-    except Exception as e:
-        app.logger.warning("assess exception: %s", e)
-        return {"error": "parse_failed", "raw": str(e)}
+        # 2) 本文から最初の {} を抜き出す保険
+        m = re.search(r"\{.*\}", txt, flags=re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception as je:
+                app.logger.warning("JSON extract decode error: %s | head=%s", je, txt[:200])
 
-def assess_from_text_or_image(user_text: str = "", image_bytes: Optional[bytes] = None) -> dict:
-    """
-    テキスト/画像から査定（買取目安のみ返す）
-    429（残高不足）は {"error":"quota"} を返す
-    """
-    if AI_DISABLED:
-        return {"error": "disabled"}
+        # 3) それでもダメなら、理由付きで返す
+        return {"error": "parse_failed", "raw": txt[:800]}
 
-    content = []
-    if user_text:
-        content.append({"type": "text", "text": f"対象情報:\n{user_text}"})
-    if image_bytes:
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-
-    try:
-        # コスト抑制：画像もテキストも gpt-4o-mini に統一
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": ASSESS_SYSTEM},
-                {"role": "user", "content": content},
-            ],
-            temperature=0.2,
-            timeout=25,
-        )
-        txt = resp.choices[0].message.content
-        return json.loads(txt)
     except RateLimitError:
         return {"error": "quota"}
     except Exception as e:
+        app.logger.warning("assess exception: %s", e)
         return {"error": "parse_failed", "raw": str(e)}
 
 
@@ -196,19 +173,14 @@ def too_frequent(user_id: str) -> bool:
     return False
 
 def record_and_check_limits(user_id: str, is_image: bool) -> Optional[str]:
-    """
-    1分あたりの画像/メッセージ数を記録し、超過したら警告文を返す。
-    超過が酷い場合は一時ブロック。
-    """
+    """1分あたりの画像/メッセージ数を記録し、超過で警告。酷ければ一時ブロック。"""
     now = time.time()
-    # 直近60秒の履歴に現在時刻をpush
     _msg_history[user_id].append(now)
-    # 60秒前より古いものを除去
     while _msg_history[user_id] and now - _msg_history[user_id][0] > 60:
         _msg_history[user_id].popleft()
 
     if len(_msg_history[user_id]) > MSG_MAX_PER_MIN:
-        block_user(user_id)  # 全体メッセージ過多
+        block_user(user_id)
         return "短時間に多数のメッセージを受信したため、一時的に受付を停止しました。しばらく経ってからお試しください。"
 
     if is_image:
@@ -216,7 +188,7 @@ def record_and_check_limits(user_id: str, is_image: bool) -> Optional[str]:
         while _img_history[user_id] and now - _img_history[user_id][0] > 60:
             _img_history[user_id].popleft()
         if len(_img_history[user_id]) > IMG_MAX_PER_MIN:
-            block_user(user_id)  # 画像連投過多
+            block_user(user_id)
             return "画像の連続送信が多いため、一時的に受付を停止しました。1分ほど時間を空けてお試しください。"
 
     return None
@@ -245,18 +217,16 @@ def webhook():
 
             source = ev.get("source", {}) or {}
             user_id = source.get("userId") or "unknown"
-            if is_blocked(user_id):
-                # ブロック中は黙って無視（200で返す）
+            if is_blocked(user_id):       # ブロック中は黙って無視
                 continue
-            if too_frequent(user_id):
-                # 連投は無視
+            if too_frequent(user_id):     # 連投は無視
                 continue
 
             msg = ev.get("message", {})
             reply_token = ev.get("replyToken")
             mtype = msg.get("type")
 
-            # メッセージ制限の記録（画像/テキスト共通）
+            # レート制限カウント（画像/テキスト共通）
             over_msg = record_and_check_limits(user_id, is_image=(mtype == "image"))
             if over_msg:
                 reply_text(reply_token, over_msg)
@@ -264,24 +234,22 @@ def webhook():
 
             # ---------- テキスト ----------
             if mtype == "text":
-                user_text = msg.get("text", "")
-                text = user_text.strip()
+                user_text = msg.get("text", "").strip()
 
-                # 1) リッチメニューの固定文言に対応
-                if text == "AI査定":
+                # リッチメニューの固定文言
+                if user_text == "AI査定":
                     reply_text(reply_token, "📸 AI査定を開始します。\n商品の写真（正面や型番ラベル）や型番テキストを送ってください。")
                     continue
-                elif text == "お問い合わせ":
+                if user_text == "お問い合わせ":
                     reply_text(reply_token, "📩 お問い合わせありがとうございます。\n内容をこちらに送信してください。スタッフが手動で返信いたします。")
                     continue
-                elif text == "出張買取を依頼":
+                if user_text == "出張買取を依頼":
                     reply_text(reply_token, "🚛 出張買取の仮予約を開始します。\nご希望の訪問日時をお知らせください。")
                     continue
 
-                # 2) それ以外のテキストは → 査定（買取目安のみ）
-                data = assess_from_text_or_image(user_text=text)
+                # 通常のテキスト査定
+                data = assess_from_text_or_image(user_text=user_text)
 
-                # フォールバック（AI停止 or 残高不足）
                 if data.get("error") in ("disabled", "quota"):
                     reply_text(
                         reply_token,
@@ -322,8 +290,7 @@ def webhook():
                 continue
 
             # ---------- 画像 ----------
-            elif mtype == "image":
-                # 画像取得 → サイズ上限チェック
+            if mtype == "image":
                 img_bytes = get_line_image_bytes(msg.get("id"))
                 if len(img_bytes) > IMG_MAX_BYTES:
                     reply_text(reply_token, "画像が大きすぎます（2MB以内で送信してください）。\n型番ラベルを接写すると精度が上がります。")
@@ -370,13 +337,11 @@ def webhook():
                 reply_text_with_quick(reply_token, "\n".join(lines), quick)
                 continue
 
-            # ---------- その他のタイプ ----------
-            else:
-                reply_text(reply_token, "対応していないメッセージ形式です。テキストまたは画像でお送りください。")
-                continue
+            # ---------- その他 ----------
+            reply_text(reply_token, "対応していないメッセージ形式です。テキストまたは画像でお送りください。")
+            continue
 
-        # 必ず200で返す（LINE要件）
-        return "", 200
+        return "", 200  # LINEの要件：常に200
 
     except Exception:
         app.logger.exception("Webhook handler crashed")
@@ -406,11 +371,9 @@ def admin_broadcast():
     return "ok", 200
 
 
+# ---------------------------
+# ローカル実行（RenderはProcfile/gunicornで起動）
+# ---------------------------
 if __name__ == "__main__":
-    # ローカル実行用。RenderではProcfileでgunicornが使われます
     app.run(host="0.0.0.0", port=5000)
 
-
-if __name__ == "__main__":
-    # ローカル実行用。RenderではProcfileでgunicornが使われます
-    app.run(host="0.0.0.0", port=5000)
