@@ -47,6 +47,23 @@ def webhook():
             # テキストだけ先に対応（画像は後で拡張）
             if mtype == "text":
                 user_text = msg.get("text", "")
+                # --- リッチメニューのボタン処理 ---
+                text = user_text.strip()
+
+                if text == "AI査定":
+                    reply_text(reply_token,
+                        "📸 AI査定を開始します。\n商品の写真（正面や型番ラベル）や型番テキストを送ってください。")
+                    continue
+
+                elif text == "お問い合わせ":
+                    reply_text(reply_token,
+                        "📩 お問い合わせありがとうございます。\n内容をこちらに送信してください。")
+                    continue
+
+                elif text == "出張買取を依頼":
+                    reply_text(reply_token,
+                        "🚛 出張買取の仮予約を開始します。\nご希望の訪問日時をお知らせください。")
+                    continue
 
                 try:
                     gpt = client.chat.completions.create(
