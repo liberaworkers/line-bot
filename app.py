@@ -3,7 +3,7 @@ from flask import Flask, request
 import requests
 
 # --- OpenAI 新SDK ---
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 import base64, json
 from typing import Optional
 
@@ -12,6 +12,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = Flask(__name__)
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
+AI_DISABLED = os.getenv("DISABLE_AI") == "1"   # ← 環境変数でAIを一時停止できる
 
 
 # ---------------------------
@@ -28,7 +29,7 @@ def reply_text(reply_token: str, text: str):
             },
             json={
                 "replyToken": reply_token,
-                "messages": [{"type": "text", "text": text[:5000]}],  # 念のため長文ガード
+                "messages": [{"type": "text", "text": text[:5000]}],
             },
             timeout=10,
         )
@@ -81,7 +82,13 @@ ASSESS_SYSTEM = (
 )
 
 def assess_from_text_or_image(user_text: str = "", image_bytes: Optional[bytes] = None) -> dict:
-    """テキスト/画像から査定（買取目安のみ返す）"""
+    """
+    テキスト/画像から査定（買取目安のみ返す）
+    429（残高不足）は {"error":"quota"} を返す
+    """
+    if AI_DISABLED:
+        return {"error": "disabled"}
+
     content = []
     if user_text:
         content.append({"type": "text", "text": f"対象情報:\n{user_text}"})
@@ -89,20 +96,23 @@ def assess_from_text_or_image(user_text: str = "", image_bytes: Optional[bytes] 
         b64 = base64.b64encode(image_bytes).decode("utf-8")
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
 
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": ASSESS_SYSTEM},
-            {"role": "user", "content": content},
-        ],
-        temperature=0.2,
-        timeout=25,
-    )
-    txt = resp.choices[0].message.content
     try:
+        # コスト抑制：画像もテキストも gpt-4o-mini に統一
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": ASSESS_SYSTEM},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.2,
+            timeout=25,
+        )
+        txt = resp.choices[0].message.content
         return json.loads(txt)
-    except Exception:
-        return {"error": "parse_failed", "raw": txt}
+    except RateLimitError:
+        return {"error": "quota"}
+    except Exception as e:
+        return {"error": "parse_failed", "raw": str(e)}
 
 
 # ---------------------------
@@ -147,91 +157,90 @@ def webhook():
                     continue
 
                 # 2) それ以外のテキストは → 査定（買取目安のみ）
-                try:
-                    data = assess_from_text_or_image(user_text=text)
-                    if "error" in data:
-                        raise RuntimeError("parse failed")
+                data = assess_from_text_or_image(user_text=text)
 
-                    low, high = data.get("estimate_low"), data.get("estimate_high")
-                    cat, brand, model = data.get("category", ""), data.get("brand", ""), data.get("model", "")
-                    tips = data.get("tips", "")
-                    pop = data.get("popularity_hint", False)
-
-                    lines = [
-                        "🧮 仮査定の買取目安です。",
-                        f"・商品：{cat} / {brand} {model}".strip(" /"),
-                        f"・買取目安：{int(low):,}円 〜 {int(high):,}円",
-                    ]
-                    if pop:
-                        lines.append("・人気のため在庫状況次第で上振れの可能性あり✨")
-                    if tips:
-                        lines.append(f"・確認ポイント：{tips}")
-                    lines.append("\n🎁 LINE友だち限定：査定金額から +500円UP クーポン適用中")
-                    lines.append("\nこのまま続けますか？")
-
-                    quick = [
-                        {"type": "action", "action": {"type": "message", "label": "正確なスタッフ査定", "text": "スタッフ査定を希望"}},
-                        {"type": "action", "action": {"type": "message", "label": "出張買取を希望", "text": "出張買取を依頼"}},
-                        {"type": "action", "action": {"type": "message", "label": "店舗に持ち込み", "text": "店舗持ち込みを希望"}},
-                    ]
-                    reply_text_with_quick(reply_token, "\n".join(lines), quick)
+                # フォールバック（AI停止 or 残高不足）
+                if data.get("error") in ("disabled", "quota"):
+                    reply_text(
+                        reply_token,
+                        "現在、AI査定がご利用いただけません。\n"
+                        "・写真と型番をこのまま送ってください（スタッフが手動で査定）\n"
+                        "・または「出張買取を依頼」を選んで仮予約できます。"
+                    )
                     continue
-                except Exception:
-                    app.logger.exception("text assess failed")
-                    # フォールバック（通常のGPT応答）
-                    try:
-                        gpt = client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[
-                                {"role": "system", "content": "あなたはリユースショップの査定担当者です。簡潔・親切に答えてください。"},
-                                {"role": "user", "content": user_text},
-                            ],
-                            timeout=10,
-                        )
-                        answer = gpt.choices[0].message.content or "ありがとうございます。"
-                    except Exception:
-                        app.logger.exception("OpenAI error")
-                        answer = "ただいま査定エンジンが混み合っています。内容をもう一度お送りいただくか、少し時間をおいてお試しください。"
 
-                    reply_text(reply_token, answer)
+                if data.get("error"):
+                    app.logger.warning(f"assess error: {data}")
+                    reply_text(reply_token, "うまく解析できませんでした。写真や型番ラベルの画像も送ってください。")
                     continue
+
+                low, high = data.get("estimate_low"), data.get("estimate_high")
+                cat, brand, model = data.get("category", ""), data.get("brand", ""), data.get("model", "")
+                tips = data.get("tips", "")
+                pop = data.get("popularity_hint", False)
+
+                lines = [
+                    "🧮 仮査定の買取目安です。",
+                    f"・商品：{cat} / {brand} {model}".strip(" /"),
+                    f"・買取目安：{int(low):,}円 〜 {int(high):,}円",
+                ]
+                if pop:
+                    lines.append("・人気のため在庫状況次第で上振れの可能性あり✨")
+                if tips:
+                    lines.append(f"・確認ポイント：{tips}")
+                lines.append("\n🎁 LINE友だち限定：査定金額から +500円UP クーポン適用中")
+                lines.append("\nこのまま続けますか？")
+
+                quick = [
+                    {"type": "action", "action": {"type": "message", "label": "正確なスタッフ査定", "text": "スタッフ査定を希望"}},
+                    {"type": "action", "action": {"type": "message", "label": "出張買取を希望", "text": "出張買取を依頼"}},
+                    {"type": "action", "action": {"type": "message", "label": "店舗に持ち込み", "text": "店舗持ち込みを希望"}},
+                ]
+                reply_text_with_quick(reply_token, "\n".join(lines), quick)
+                continue
 
             # ---------- 画像 ----------
             elif mtype == "image":
-                try:
-                    img = get_line_image_bytes(msg.get("id"))
-                    data = assess_from_text_or_image(image_bytes=img)
-                    if "error" in data:
-                        raise RuntimeError("parse failed")
+                data = assess_from_text_or_image(image_bytes=get_line_image_bytes(msg.get("id")))
 
-                    low, high = data.get("estimate_low"), data.get("estimate_high")
-                    cat, brand, model = data.get("category", ""), data.get("brand", ""), data.get("model", "")
-                    tips = data.get("tips", "")
-                    pop = data.get("popularity_hint", False)
-
-                    lines = [
-                        "📸 画像を確認しました。仮査定の買取目安です。",
-                        f"・商品：{cat} / {brand} {model}".strip(" /"),
-                        f"・買取目安：{int(low):,}円 〜 {int(high):,}円",
-                    ]
-                    if pop:
-                        lines.append("・人気のため在庫状況次第で上振れの可能性あり✨")
-                    if tips:
-                        lines.append(f"・確認ポイント：{tips}")
-                    lines.append("\n🎁 LINE友だち限定：査定金額から +500円UP クーポン適用中")
-                    lines.append("\nこのまま続けますか？")
-
-                    quick = [
-                        {"type": "action", "action": {"type": "message", "label": "正確なスタッフ査定", "text": "スタッフ査定を希望"}},
-                        {"type": "action", "action": {"type": "message", "label": "出張買取を希望", "text": "出張買取を依頼"}},
-                        {"type": "action", "action": {"type": "message", "label": "店舗に持ち込み", "text": "店舗持ち込みを希望"}},
-                    ]
-                    reply_text_with_quick(reply_token, "\n".join(lines), quick)
+                if data.get("error") in ("disabled", "quota"):
+                    reply_text(
+                        reply_token,
+                        "現在、AI査定がご利用いただけません。\n"
+                        "・型番ラベルにピントを合わせた写真を送ってください（スタッフが手動で査定）\n"
+                        "・または「出張買取を依頼」を選んで仮予約できます。"
+                    )
                     continue
-                except Exception:
-                    app.logger.exception("image assess failed")
+
+                if data.get("error"):
+                    app.logger.warning(f"assess error: {data}")
                     reply_text(reply_token, "画像の解析に失敗しました。型番ラベルにピントを合わせてもう一度送ってください。")
                     continue
+
+                low, high = data.get("estimate_low"), data.get("estimate_high")
+                cat, brand, model = data.get("category", ""), data.get("brand", ""), data.get("model", "")
+                tips = data.get("tips", "")
+                pop = data.get("popularity_hint", False)
+
+                lines = [
+                    "📸 画像を確認しました。仮査定の買取目安です。",
+                    f"・商品：{cat} / {brand} {model}".strip(" /"),
+                    f"・買取目安：{int(low):,}円 〜 {int(high):,}円",
+                ]
+                if pop:
+                    lines.append("・人気のため在庫状況次第で上振れの可能性あり✨")
+                if tips:
+                    lines.append(f"・確認ポイント：{tips}")
+                lines.append("\n🎁 LINE友だち限定：査定金額から +500円UP クーポン適用中")
+                lines.append("\nこのまま続けますか？")
+
+                quick = [
+                    {"type": "action", "action": {"type": "message", "label": "正確なスタッフ査定", "text": "スタッフ査定を希望"}},
+                    {"type": "action", "action": {"type": "message", "label": "出張買取を希望", "text": "出張買取を依頼"}},
+                    {"type": "action", "action": {"type": "message", "label": "店舗に持ち込み", "text": "店舗持ち込みを希望"}},
+                ]
+                reply_text_with_quick(reply_token, "\n".join(lines), quick)
+                continue
 
             # ---------- その他のタイプ ----------
             else:
@@ -272,4 +281,3 @@ def admin_broadcast():
 if __name__ == "__main__":
     # ローカル実行用。RenderではProcfileでgunicornが使われます
     app.run(host="0.0.0.0", port=5000)
-
