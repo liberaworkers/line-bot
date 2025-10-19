@@ -112,6 +112,54 @@ def assess_from_text_or_image(user_text: str = "", image_bytes: Optional[bytes] 
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
 
     try:
+        # JSON出力を強制（パース失敗を減らす）
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": ASSESS_SYSTEM},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.2,
+            timeout=25,
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+
+        # 返答が空なら専用エラー
+        if not txt:
+            app.logger.warning("OpenAI empty response: %s", str(resp)[:500])
+            return {"error": "empty_response", "raw": "(no data from OpenAI)"}
+
+        # デバッグ用：先頭だけログ
+        app.logger.info("OpenAI raw (head): %s", txt[:200])
+
+        return json.loads(txt)
+
+    except RateLimitError:
+        return {"error": "quota"}
+    except json.JSONDecodeError as je:
+        app.logger.warning("JSON decode error: %s | text head=%s", je, txt[:200])
+        return {"error": "parse_failed", "raw": txt[:500]}
+    except Exception as e:
+        app.logger.warning("assess exception: %s", e)
+        return {"error": "parse_failed", "raw": str(e)}
+
+def assess_from_text_or_image(user_text: str = "", image_bytes: Optional[bytes] = None) -> dict:
+    """
+    テキスト/画像から査定（買取目安のみ返す）
+    429（残高不足）は {"error":"quota"} を返す
+    """
+    if AI_DISABLED:
+        return {"error": "disabled"}
+
+    content = []
+    if user_text:
+        content.append({"type": "text", "text": f"対象情報:\n{user_text}"})
+    if image_bytes:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+
+    try:
         # コスト抑制：画像もテキストも gpt-4o-mini に統一
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
