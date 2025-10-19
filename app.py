@@ -1,18 +1,33 @@
 import os
+import time
+from collections import defaultdict, deque
+from typing import Optional
+
 from flask import Flask, request
 import requests
 
 # --- OpenAI 新SDK ---
 from openai import OpenAI, RateLimitError
 import base64, json
-from typing import Optional
 
+# ========= 環境 =========
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 app = Flask(__name__)
-
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
-AI_DISABLED = os.getenv("DISABLE_AI") == "1"   # ← 環境変数でAIを一時停止できる
+AI_DISABLED = os.getenv("DISABLE_AI") == "1"   # ← 環境変数でAIを一時停止できる（"1"で有人モード）
+
+# ========= スパム/嫌がらせ対策（閾値は運用に合わせて調整） =========
+RATE_MIN_INTERVAL_SEC = 5        # 1ユーザーの最小インターバル（秒）…5秒以内の連投を無視
+IMG_MAX_BYTES = 2 * 1024 * 1024  # 画像サイズ上限（2MB）
+IMG_MAX_PER_MIN = 3              # 1分あたり最大画像枚数
+MSG_MAX_PER_MIN = 15             # 1分あたり最大メッセージ数
+TEMP_BLOCK_MINUTES = 30          # 一時ブロック時間（分）
+
+# 状態（インメモリ）。Render再起動でリセットされる想定。
+_last_msg_time = defaultdict(float)                  # userId -> 最終受信時刻
+_img_history = defaultdict(lambda: deque(maxlen=60)) # userId -> 直近60秒の画像受信タイムスタンプ
+_msg_history = defaultdict(lambda: deque(maxlen=60)) # userId -> 直近60秒の全メッセージ受信TS
+_blocked_until = defaultdict(float)                  # userId -> ブロック解除UNIX時刻
 
 
 # ---------------------------
@@ -116,6 +131,50 @@ def assess_from_text_or_image(user_text: str = "", image_bytes: Optional[bytes] 
 
 
 # ---------------------------
+# スパム/嫌がらせ対策ヘルパ
+# ---------------------------
+def is_blocked(user_id: str) -> bool:
+    return time.time() < _blocked_until[user_id]
+
+def block_user(user_id: str, minutes: int = TEMP_BLOCK_MINUTES):
+    _blocked_until[user_id] = time.time() + minutes * 60
+
+def too_frequent(user_id: str) -> bool:
+    """最小インターバル未満の連投をブロック"""
+    now = time.time()
+    if now - _last_msg_time[user_id] < RATE_MIN_INTERVAL_SEC:
+        return True
+    _last_msg_time[user_id] = now
+    return False
+
+def record_and_check_limits(user_id: str, is_image: bool) -> Optional[str]:
+    """
+    1分あたりの画像/メッセージ数を記録し、超過したら警告文を返す。
+    超過が酷い場合は一時ブロック。
+    """
+    now = time.time()
+    # 直近60秒の履歴に現在時刻をpush
+    _msg_history[user_id].append(now)
+    # 60秒前より古いものを除去
+    while _msg_history[user_id] and now - _msg_history[user_id][0] > 60:
+        _msg_history[user_id].popleft()
+
+    if len(_msg_history[user_id]) > MSG_MAX_PER_MIN:
+        block_user(user_id)  # 全体メッセージ過多
+        return "短時間に多数のメッセージを受信したため、一時的に受付を停止しました。しばらく経ってからお試しください。"
+
+    if is_image:
+        _img_history[user_id].append(now)
+        while _img_history[user_id] and now - _img_history[user_id][0] > 60:
+            _img_history[user_id].popleft()
+        if len(_img_history[user_id]) > IMG_MAX_PER_MIN:
+            block_user(user_id)  # 画像連投過多
+            return "画像の連続送信が多いため、一時的に受付を停止しました。1分ほど時間を空けてお試しください。"
+
+    return None
+
+
+# ---------------------------
 # ヘルスチェック
 # ---------------------------
 @app.route("/ping", methods=["GET"])
@@ -136,9 +195,24 @@ def webhook():
             if ev.get("type") != "message":
                 continue
 
+            source = ev.get("source", {}) or {}
+            user_id = source.get("userId") or "unknown"
+            if is_blocked(user_id):
+                # ブロック中は黙って無視（200で返す）
+                continue
+            if too_frequent(user_id):
+                # 連投は無視
+                continue
+
             msg = ev.get("message", {})
             reply_token = ev.get("replyToken")
             mtype = msg.get("type")
+
+            # メッセージ制限の記録（画像/テキスト共通）
+            over_msg = record_and_check_limits(user_id, is_image=(mtype == "image"))
+            if over_msg:
+                reply_text(reply_token, over_msg)
+                continue
 
             # ---------- テキスト ----------
             if mtype == "text":
@@ -201,7 +275,13 @@ def webhook():
 
             # ---------- 画像 ----------
             elif mtype == "image":
-                data = assess_from_text_or_image(image_bytes=get_line_image_bytes(msg.get("id")))
+                # 画像取得 → サイズ上限チェック
+                img_bytes = get_line_image_bytes(msg.get("id"))
+                if len(img_bytes) > IMG_MAX_BYTES:
+                    reply_text(reply_token, "画像が大きすぎます（2MB以内で送信してください）。\n型番ラベルを接写すると精度が上がります。")
+                    continue
+
+                data = assess_from_text_or_image(image_bytes=img_bytes)
 
                 if data.get("error") in ("disabled", "quota"):
                     reply_text(
@@ -276,6 +356,11 @@ def admin_broadcast():
           "\n\n査定は画像か型番を送るだけ！LINE友だち限定 +500円UP中🎁"
     broadcast_text(msg)
     return "ok", 200
+
+
+if __name__ == "__main__":
+    # ローカル実行用。RenderではProcfileでgunicornが使われます
+    app.run(host="0.0.0.0", port=5000)
 
 
 if __name__ == "__main__":
